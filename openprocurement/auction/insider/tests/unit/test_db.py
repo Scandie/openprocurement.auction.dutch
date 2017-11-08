@@ -1,5 +1,8 @@
+import errno
 import datetime
 import pytest
+
+from couchdb.http import HTTPError
 
 from openprocurement.auction.insider.tests.data.data import tender_data
 
@@ -166,3 +169,104 @@ def test_prepare_auction_document(auction, mocker):
     assert mock_save_auction_document.call_count == 2
     assert mock_get_auction_info.call_count == 2
     assert len(auction.auction_document['stages']) == 87
+
+
+@pytest.mark.parametrize(
+    'auction_data, auction_document, log_msg',
+    [
+        (
+            'tender_data', 'document_from_auction_data', 'Prepare insider auction id=auction_id'
+        ),
+        (
+            False, {'_rev': 'revision'}, 'Auction auction_id not exists'
+        ),
+
+    ],
+    ids=['with auction data', 'without auction data']
+)
+def test_prepare_auction(auction, logger, mocker, auction_data, auction_document, log_msg):
+
+    mock_generate_request_id = mocker.patch.object(auction, 'generate_request_id', autospec=True)
+    mock_save_auction_document = mocker.patch.object(auction, 'save_auction_document', autospec=True)
+    mock_get_auction_document = mocker.patch.object(auction, 'get_auction_document', autospec=True)
+    mock_get_auction_document.return_value = {'_rev': 'revision'}
+
+    mock_get_tender_data = mocker.MagicMock(return_value=auction_data)
+    mocker.patch('openprocurement.auction.insider.mixins.get_tender_data', mock_get_tender_data)
+    mock_prepare_auction_data = mocker.MagicMock(return_value=auction_document)
+    mocker.patch('openprocurement.auction.insider.utils.prepare_auction_data', mock_prepare_auction_data)
+
+    auction.tender_url = 'tender_url'
+    auction.request_id = 'request_id'
+    auction.session = 'session'
+    auction.auction_doc_id = 'auction_id'
+
+    auction.prepare_auction()
+    log_strings = logger.log_capture_string.getvalue().split('\n')
+
+    assert mock_generate_request_id.call_count == 1
+    mock_get_tender_data.assert_called_once_with('tender_url', request_id='request_id', session='session')
+    assert mock_get_auction_document.call_count == 1
+    if auction_data:
+        mock_prepare_auction_data.assert_called_once_with(auction_data)
+        assert mock_save_auction_document.call_count == 1
+    assert auction.auction_document == auction_document
+
+    assert log_strings[-2] == log_msg
+
+
+def test_save_auction_document(auction, db, mocker, logger):
+    auction.prepare_auction_document()
+    response = auction.save_auction_document()
+    assert len(response) == 2
+    assert response[0] == auction.auction_document['_id']
+    assert response[1] == auction.auction_document['_rev']
+
+    mock_db_save = mocker.patch.object(auction.db, 'save', autospec=True)
+    for side, msg in zip([
+        HTTPError('status code is >= 400'),
+        Exception('unhandled error message'),
+        Exception(errno.EPIPE, 'retryable error message'),
+        ], [
+            'Error while save document: status code is >= 400',
+            'Unhandled error: unhandled error message',
+            "Error while save document: (32, 'retryable error message')",
+            ]):
+        mock_db_save.side_effect = side
+        auction.save_auction_document()
+        log_strings = logger.log_capture_string.getvalue().split('\n')
+        assert msg in log_strings
+
+
+def test_get_auction_document(auction, db, mocker, logger):
+    auction.prepare_auction_document()
+    pub_doc = auction.db.get(auction.auction_doc_id)
+    del auction.auction_document
+    res = auction.get_auction_document()
+    assert res == pub_doc
+
+    log_strings = logger.log_capture_string.getvalue().split('\n')
+    assert 'Rev error' not in log_strings
+    auction.auction_document['_rev'] = 'wrong_rev'
+    res = auction.get_auction_document()
+    log_strings = logger.log_capture_string.getvalue().split('\n')
+    assert res == pub_doc
+    assert 'Rev error' in log_strings
+
+    mock_db_get = mocker.patch.object(auction.db, 'get', autospec=True)
+    for side, msg in zip([
+                HTTPError('status code is >= 400'),
+                Exception('unhandled error message'),
+                Exception(errno.EPIPE, 'retryable error message'),
+                res
+            ],
+            [
+                'Error while get document: status code is >= 400',
+                'Unhandled error: unhandled error message',
+                "Error while get document: (32, 'retryable error message')",
+                'Get auction document {0} with rev {1}'.format(res['_id'], res['_rev'])
+            ]):
+        mock_db_get.side_effect = side
+        auction.get_auction_document()
+        log_strings = logger.log_capture_string.getvalue().split('\n')
+        assert msg in log_strings
